@@ -77,6 +77,9 @@ function snippets(text, matches) {
   }).join(' ');
 }
 
+const showErrors = (c, r) => show(String(r.matches.length), 'bad', snippets(c.text, r.matches), 8000);
+
+// hotkey: badge checks itself and always answers
 listen('captured', async ({ payload: c }) => {
   captured = c;
   const my = ++seq;
@@ -86,10 +89,17 @@ listen('captured', async ({ payload: c }) => {
     const r = await invoke('lt_check', { text: c.text });
     if (my !== seq) return;
     if (!r.matches.length) return show('✓', 'ok', 'Ошибок нет', 2000);
-    show(String(r.matches.length), 'bad', snippets(c.text, r.matches), 8000);
+    showErrors(c, r);
   } catch (e) {
     if (my === seq) show('!', '', esc(String(e)).slice(0, 200), 4000);
   }
+});
+
+// typing pause: already checked in Rust; shown only when there is something to fix
+listen('checked', ({ payload: { c, r } }) => {
+  seq++;
+  captured = c;
+  if (r.matches.length) showErrors(c, r); else hide();
 });
 </script>
 </body>

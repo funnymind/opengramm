@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Captured {
     pub text: String,
-    /// selection | field | line | clipboard | none
+    /// selection | field | paragraph | line | clipboard | none
     pub source: String,
     pub app: String,
     /// Set only when reading was refused for privacy; then no clipboard fallback either.
@@ -52,7 +52,7 @@ pub use win::{capture, cursor_pos, hide_raw, show_no_activate};
 
 #[cfg(not(windows))]
 // ponytail: macOS stub — clipboard fallback only, AXUIElement goes here later
-pub fn capture(_blocklist: &[String]) -> Captured {
+pub fn capture(_blocklist: &[String], _max_chars: usize) -> Captured {
     Captured { source: "none".into(), ..Default::default() }
 }
 #[cfg(not(windows))]
@@ -208,7 +208,7 @@ mod win {
         (!v.trim().is_empty() && !terminal).then_some((v, "field"))
     }
 
-    pub fn capture(blocklist: &[String]) -> Captured {
+    pub fn capture(blocklist: &[String], max_chars: usize) -> Captured {
         let app = foreground_app();
         if blocklist.iter().any(|b| b.eq_ignore_ascii_case(&app)) {
             return Captured { error: Some(format!("{app} в чёрном списке, текст не читаю")), app, ..Default::default() };
@@ -229,6 +229,15 @@ mod win {
         if let Some((text, source)) = read_text(&el, tp.as_ref(), terminal) {
             c.text = text;
             c.source = source.into();
+        }
+        if c.text.chars().count() > max_chars {
+            // long document: only the paragraph being typed
+            let para = tp.as_ref().and_then(caret_range).and_then(|r| {
+                r.expand_to_enclosing_unit(TextUnit::Paragraph).ok()?;
+                r.get_text(-1).ok()
+            });
+            c.text = para.unwrap_or_default();
+            c.source = "paragraph".into();
         }
         c.caret = tp
             .as_ref()

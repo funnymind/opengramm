@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod capture;
+mod typing;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
@@ -28,6 +30,13 @@ struct Config {
     model: String,
     /// Process names (e.g. "KeePassXC.exe") whose text is never read
     blocklist: Vec<String>,
+    /// Check automatically when typing pauses
+    auto_check: bool,
+    auto_delay_ms: u64,
+    /// At most one LanguageTool request per this interval (public API: 20/min)
+    auto_min_interval_ms: u64,
+    /// Longer fields are checked by the paragraph at the caret
+    auto_max_chars: usize,
 }
 
 impl Default for Config {
@@ -42,6 +51,10 @@ impl Default for Config {
             blocklist: ["KeePass.exe", "KeePassXC.exe", "1Password.exe", "Bitwarden.exe", "mstsc.exe"]
                 .map(String::from)
                 .to_vec(),
+            auto_check: true,
+            auto_delay_ms: 1500,
+            auto_min_interval_ms: 3000,
+            auto_max_chars: 2000,
         }
     }
 }
@@ -71,7 +84,7 @@ fn on_hotkey(app: &AppHandle, badge: bool) {
     // UIA initializes COM itself; keep it off the UI thread
     std::thread::spawn(move || {
         let cfg = app.state::<Config>();
-        let mut c = capture::capture(&cfg.blocklist);
+        let mut c = capture::capture(&cfg.blocklist, usize::MAX);
         if c.error.is_none() && c.text.trim().is_empty() {
             c.text = app.clipboard().read_text().unwrap_or_default();
             c.source = "clipboard".into();
@@ -141,11 +154,49 @@ fn err(e: impl ToString) -> String {
     e.to_string()
 }
 
-#[tauri::command]
-async fn lt_check(text: String, cfg: State<'_, Config>) -> Result<Value, String> {
+/// Runs on its own thread: one LT request per typing pause, only if the text changed
+fn auto_loop(app: AppHandle) {
+    let cfg = app.state::<Config>().inner().clone();
+    let own_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let min_interval = Duration::from_millis(cfg.auto_min_interval_ms);
+    let mut last_check: Option<Instant> = None;
+    let mut last_text = String::new();
+    typing::start_hook();
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        if !typing::take_if_idle(cfg.auto_delay_ms) {
+            continue;
+        }
+        if last_check.is_some_and(|t| t.elapsed() < min_interval) {
+            typing::mark_dirty(); // retry on a later tick
+            continue;
+        }
+        let c = capture::capture(&cfg.blocklist, cfg.auto_max_chars);
+        // no clipboard fallback and no error badges here: stay silent unless there is something to fix
+        if c.error.is_some() || c.text.trim().is_empty() || c.app.eq_ignore_ascii_case(&own_exe) {
+            continue;
+        }
+        if c.text == last_text || c.text.chars().count() > cfg.auto_max_chars {
+            continue;
+        }
+        last_check = Some(Instant::now());
+        last_text = c.text.clone();
+        let Ok(r) = tauri::async_runtime::block_on(lt(&cfg, &c.text)) else { continue };
+        let Some(win) = app.get_webview_window("badge") else { continue };
+        if r["matches"].as_array().is_some_and(|m| !m.is_empty()) {
+            place(&win, c.caret, (540.0 * win.scale_factor().unwrap_or(1.0)) as u32);
+        }
+        let _ = win.emit("checked", json!({ "c": c, "r": r }));
+    }
+}
+
+async fn lt(cfg: &Config, text: &str) -> Result<Value, String> {
     let res = reqwest::Client::new()
         .post(&cfg.lt_url)
-        .form(&[("text", text.as_str()), ("language", cfg.language.as_str())])
+        .form(&[("text", text), ("language", cfg.language.as_str())])
         .send()
         .await
         .map_err(err)?;
@@ -153,6 +204,11 @@ async fn lt_check(text: String, cfg: State<'_, Config>) -> Result<Value, String>
         return Err(format!("LanguageTool {}: {}", res.status(), res.text().await.unwrap_or_default()));
     }
     res.json().await.map_err(err)
+}
+
+#[tauri::command]
+async fn lt_check(text: String, cfg: State<'_, Config>) -> Result<Value, String> {
+    lt(&cfg, &text).await
 }
 
 #[tauri::command]
@@ -204,7 +260,12 @@ fn main() {
         .setup(|app| {
             let cfg = load_config(app.handle());
             let (hotkey, check_hotkey) = (cfg.hotkey.clone(), cfg.check_hotkey.clone());
+            let auto = cfg.auto_check;
             app.manage(cfg);
+            if auto {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || auto_loop(handle));
+            }
 
             let check_id = check_hotkey.parse::<Shortcut>().map(|s| s.id()).unwrap_or_default();
             app.handle().plugin(
