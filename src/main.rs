@@ -1,0 +1,197 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod capture;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::path::PathBuf;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WindowEvent};
+use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+const SYSTEM_PROMPT: &str = "Ты редактор текста. Перепиши текст пользователя по инструкции. \
+Сохраняй язык оригинала, смысл, имена, ссылки и форматирование. \
+Верни только готовый текст, без пояснений, вступлений и кавычек.";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct Config {
+    hotkey: String,
+    /// LanguageTool language code, "auto" to detect
+    language: String,
+    lt_url: String,
+    openrouter_key: String,
+    model: String,
+    /// Process names (e.g. "KeePassXC.exe") whose text is never read
+    blocklist: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            hotkey: "ctrl+alt+g".into(),
+            language: "auto".into(),
+            lt_url: "https://api.languagetool.org/v2/check".into(),
+            openrouter_key: String::new(),
+            model: "anthropic/claude-haiku-4.5".into(),
+            blocklist: ["KeePass.exe", "KeePassXC.exe", "1Password.exe", "Bitwarden.exe", "mstsc.exe"]
+                .map(String::from)
+                .to_vec(),
+        }
+    }
+}
+
+fn config_path(app: &AppHandle) -> PathBuf {
+    app.path().app_config_dir().expect("no config dir").join("config.json")
+}
+
+fn load_config(app: &AppHandle) -> Config {
+    let path = config_path(app);
+    if !path.exists() {
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let _ = std::fs::write(&path, serde_json::to_string_pretty(&Config::default()).unwrap());
+    }
+    let mut cfg: Config = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if cfg.openrouter_key.is_empty() {
+        cfg.openrouter_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+    }
+    cfg
+}
+
+fn on_hotkey(app: &AppHandle) {
+    let app = app.clone();
+    // UIA initializes COM itself; keep it off the UI thread
+    std::thread::spawn(move || {
+        let cfg = app.state::<Config>();
+        let mut c = capture::capture(&cfg.blocklist);
+        if c.error.is_none() && c.text.trim().is_empty() {
+            c.text = app.clipboard().read_text().unwrap_or_default();
+            c.source = "clipboard";
+        }
+        show_popup(&app, c);
+    });
+}
+
+fn show_popup(app: &AppHandle, c: capture::Captured) {
+    let Some(win) = app.get_webview_window("main") else { return };
+    let (mut x, mut y) = capture::cursor_pos();
+    if let (Ok(Some(m)), Ok(size)) = (win.monitor_from_point(x as f64, y as f64), win.outer_size()) {
+        let (mp, ms) = (m.position(), m.size());
+        x = x.min(mp.x + ms.width as i32 - size.width as i32).max(mp.x);
+        y = (y + 16).min(mp.y + ms.height as i32 - size.height as i32).max(mp.y);
+    }
+    let _ = win.set_position(PhysicalPosition::new(x, y));
+    let _ = win.emit("captured", c);
+    let _ = win.show();
+    let _ = win.set_focus();
+}
+
+fn err(e: impl ToString) -> String {
+    e.to_string()
+}
+
+#[tauri::command]
+async fn lt_check(text: String, cfg: State<'_, Config>) -> Result<Value, String> {
+    let res = reqwest::Client::new()
+        .post(&cfg.lt_url)
+        .form(&[("text", text.as_str()), ("language", cfg.language.as_str())])
+        .send()
+        .await
+        .map_err(err)?;
+    if !res.status().is_success() {
+        return Err(format!("LanguageTool {}: {}", res.status(), res.text().await.unwrap_or_default()));
+    }
+    res.json().await.map_err(err)
+}
+
+#[tauri::command]
+async fn rewrite(text: String, instruction: String, cfg: State<'_, Config>) -> Result<String, String> {
+    if cfg.openrouter_key.is_empty() {
+        return Err("Нет ключа OpenRouter: укажите openrouter_key в config.json (трей → Настройки) или OPENROUTER_API_KEY".into());
+    }
+    let body = json!({
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": format!("Инструкция: {instruction}\n\nТекст:\n{text}")}
+        ]
+    });
+    let v: Value = reqwest::Client::new()
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(&cfg.openrouter_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(err)?
+        .json()
+        .await
+        .map_err(err)?;
+    v["choices"][0]["message"]["content"]
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| format!("OpenRouter: {}", v["error"]["message"].as_str().unwrap_or(&v.to_string())))
+}
+
+#[tauri::command]
+fn source_info(cfg: State<'_, Config>) -> Value {
+    json!({ "model": cfg.model, "lt": cfg.lt_url, "hotkey": cfg.hotkey })
+}
+
+fn open_config(app: &AppHandle) {
+    let path = config_path(app);
+    #[cfg(windows)]
+    let _ = std::process::Command::new("notepad").arg(path).spawn();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("open").arg("-t").arg(path).spawn();
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .setup(|app| {
+            let cfg = load_config(app.handle());
+            let hotkey = cfg.hotkey.clone();
+            app.manage(cfg);
+
+            app.handle().plugin(
+                tauri_plugin_global_shortcut::Builder::new()
+                    .with_handler(|app, _, event| {
+                        if event.state == ShortcutState::Pressed {
+                            on_hotkey(app);
+                        }
+                    })
+                    .build(),
+            )?;
+            if let Err(e) = app.global_shortcut().register(hotkey.as_str()) {
+                let error = Some(format!("Горячая клавиша {hotkey} недоступна ({e}). Поменяйте hotkey в config.json и перезапустите."));
+                show_popup(app.handle(), capture::Captured { error, ..Default::default() });
+            }
+
+            let settings = MenuItem::with_id(app, "config", "Настройки (config.json)", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip(format!("opengramm: {hotkey}"))
+                .menu(&Menu::with_items(app, &[&settings, &quit])?)
+                .on_menu_event(|app, e| match e.id.as_ref() {
+                    "config" => open_config(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .build(app)?;
+            Ok(())
+        })
+        .on_window_event(|win, e| {
+            if let WindowEvent::CloseRequested { api, .. } = e {
+                api.prevent_close();
+                let _ = win.hide();
+            }
+        })
+        .invoke_handler(tauri::generate_handler![lt_check, rewrite, source_info])
+        .run(tauri::generate_context!())
+        .expect("error while running opengramm");
+}

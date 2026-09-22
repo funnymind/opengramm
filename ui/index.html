@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>opengramm</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1b1f; --muted:#6b6b76; --line:#e3e3e8; --card:#f6f6f8; --accent:#16a34a; --err:#dc2626; --warn:#d97706; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1c1c20; --fg:#ececf1; --muted:#9a9aa6; --line:#33333a; --card:#26262c; --accent:#22c55e; --err:#f87171; --warn:#fbbf24; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:13px/1.45 "Segoe UI", system-ui, sans-serif; }
+  body { display:flex; flex-direction:column; border:1px solid var(--line); }
+  header { display:flex; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid var(--line); cursor:move; user-select:none; }
+  header b { color:var(--accent); }
+  header .src { color:var(--muted); flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  main { flex:1; overflow:auto; padding:8px 10px; display:flex; flex-direction:column; gap:8px; }
+  textarea { width:100%; resize:vertical; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:inherit; }
+  /* underline layer: mirrors #text behind a transparent textarea */
+  .editor { position:relative; background:var(--card); border-radius:6px; }
+  #text, #hl { font:inherit; line-height:inherit; padding:6px 8px; border:1px solid transparent; border-radius:6px;
+               white-space:pre-wrap; overflow-wrap:break-word; scrollbar-gutter:stable; }
+  #text { position:relative; z-index:1; display:block; min-height:90px; background:transparent; border-color:var(--line); overflow-y:auto; }
+  #hl { position:absolute; inset:0; margin:0; color:transparent; overflow:hidden; pointer-events:none; }
+  #hl mark { color:transparent; background:none; text-decoration:underline wavy var(--err); text-decoration-skip-ink:none; text-underline-offset:3px; }
+  #hl mark.style { text-decoration-color:var(--warn); }
+  #issues { display:flex; flex-direction:column; gap:4px; }
+  .issue { background:var(--card); border-left:3px solid var(--err); border-radius:4px; padding:4px 8px; }
+  .issue.style { border-left-color:var(--warn); }
+  .issue s { color:var(--err); }
+  .issue .msg { color:var(--muted); }
+  button { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:5px; padding:3px 8px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .rep { color:var(--accent); font-weight:600; margin:2px 4px 0 0; }
+  .row { display:flex; flex-wrap:wrap; gap:4px; align-items:center; }
+  input { flex:1; min-width:120px; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:5px; padding:3px 8px; font:inherit; }
+  #result { display:none; flex-direction:column; gap:4px; }
+  #out { min-height:80px; }
+  footer { display:flex; gap:6px; align-items:center; padding:6px 10px; border-top:1px solid var(--line); }
+  #status { flex:1; color:var(--muted); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .ok { color:var(--accent); }
+  .bad { color:var(--err); }
+</style>
+</head>
+<body>
+<header data-tauri-drag-region>
+  <b data-tauri-drag-region>opengramm</b>
+  <span class="src" id="src" data-tauri-drag-region></span>
+  <button id="close" title="Esc">✕</button>
+</header>
+<main>
+  <div class="editor">
+    <div id="hl" aria-hidden="true"></div>
+    <textarea id="text" spellcheck="false" placeholder="Выделите текст в любом поле (или скопируйте его) и нажмите горячую клавишу"></textarea>
+  </div>
+  <div id="issues"></div>
+  <div class="row" id="presets">
+    <button data-i="Исправь орфографию, пунктуацию и грамматику. Больше ничего не меняй.">Исправить</button>
+    <button data-i="Сделай тон более формальным и деловым.">Формальнее</button>
+    <button data-i="Сделай тон дружелюбнее и теплее.">Дружелюбнее</button>
+    <button data-i="Сделай проще и понятнее, короткими предложениями.">Проще</button>
+    <button data-i="Сократи, убери воду, сохрани смысл.">Короче</button>
+    <button data-i="Сделай убедительнее и увереннее.">Увереннее</button>
+  </div>
+  <div class="row">
+    <input id="custom" placeholder="Своя инструкция: «как пост в телеграм», «переведи на английский»… (Enter)">
+  </div>
+  <div id="result">
+    <textarea id="out" spellcheck="false"></textarea>
+    <div class="row">
+      <button class="primary" id="accept">Принять</button>
+      <button id="copyOut">Копировать</button>
+    </div>
+  </div>
+</main>
+<footer>
+  <span id="status"></span>
+  <button class="primary" id="copy" title="Ctrl+Enter">Копировать и закрыть</button>
+</footer>
+<script>
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+const win = window.__TAURI__.window.getCurrentWindow();
+const $ = id => document.getElementById(id);
+const text = $('text'), issuesEl = $('issues'), status = $('status');
+const SRC = { selection: 'выделение', field: 'всё поле', clipboard: 'буфер обмена', none: '' };
+let matches = [], timer, seq = 0;
+
+function setStatus(msg, cls = '') { status.textContent = msg; status.className = cls; }
+function esc(s) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+listen('captured', ({ payload: c }) => {
+  $('src').textContent = [c.app, SRC[c.source]].filter(Boolean).join(' · ');
+  $('result').style.display = 'none';
+  text.value = c.error ? '' : c.text;
+  matches = []; render();
+  if (c.error) return setStatus(c.error, 'bad');
+  if (!c.text.trim()) return setStatus('Текст не найден: выделите его или скопируйте (Ctrl+C) и повторите');
+  check();
+  text.focus();
+});
+
+// LanguageTool: on open, and after the user stops typing
+async function check() {
+  const value = text.value, my = ++seq;
+  if (!value.trim()) { matches = []; render(); return setStatus(''); }
+  if (value.length > 20000) return setStatus('Для публичного LanguageTool текст длиннее 20 000 символов', 'bad');
+  setStatus('Проверяю…');
+  try {
+    const r = await invoke('lt_check', { text: value });
+    if (my !== seq) return; // text changed meanwhile
+    matches = r.matches;
+    render();
+    setStatus(matches.length ? `Замечаний: ${matches.length}` : 'Ошибок не найдено ✓', matches.length ? '' : 'ok');
+  } catch (e) { if (my === seq) setStatus(String(e), 'bad'); }
+}
+// offsets go stale on edit, so drop matches until the next check
+text.addEventListener('input', () => { matches = []; render(); clearTimeout(timer); seq++; timer = setTimeout(check, 800); });
+text.addEventListener('scroll', () => { $('hl').scrollTop = text.scrollTop; });
+
+const isStyle = m => m.rule.issueType !== 'misspelling' && m.rule.issueType !== 'grammar';
+
+function render() {
+  issuesEl.innerHTML = matches.map((m, i) => {
+    const bad = text.value.substr(m.offset, m.length);
+    const reps = m.replacements.slice(0, 5)
+      .map((r, j) => `<button class="rep" data-m="${i}" data-r="${j}">${esc(r.value) || '∅'}</button>`).join('');
+    return `<div class="issue${isStyle(m) ? ' style' : ''}"><s>${esc(bad)}</s> <span class="msg">${esc(m.message)}</span><div>${reps}</div></div>`;
+  }).join('');
+
+  const v = text.value;
+  let html = '', pos = 0;
+  for (const m of [...matches].sort((a, b) => a.offset - b.offset)) {
+    if (m.offset < pos) continue; // overlapping match
+    html += esc(v.slice(pos, m.offset)) + `<mark class="${isStyle(m) ? 'style' : ''}">${esc(v.substr(m.offset, m.length))}</mark>`;
+    pos = m.offset + m.length;
+  }
+  $('hl').innerHTML = html + esc(v.slice(pos)) + '\n'; // trailing \n keeps heights equal
+  $('hl').scrollTop = text.scrollTop;
+}
+
+issuesEl.addEventListener('click', e => {
+  const b = e.target.closest('.rep'); if (!b) return;
+  const m = matches[b.dataset.m], rep = m.replacements[b.dataset.r].value;
+  const v = text.value;
+  text.value = v.slice(0, m.offset) + rep + v.slice(m.offset + m.length);
+  const delta = rep.length - m.length;
+  matches = matches.filter(x => x !== m).map(x => x.offset > m.offset ? { ...x, offset: x.offset + delta } : x);
+  render();
+  clearTimeout(timer); seq++; timer = setTimeout(check, 1500);
+});
+
+// LLM via OpenRouter: only on explicit action
+async function rewrite(instruction) {
+  const value = text.value.trim();
+  if (!value) return;
+  setStatus('Переписываю…');
+  try {
+    $('out').value = await invoke('rewrite', { text: value, instruction });
+    $('result').style.display = 'flex';
+    setStatus('Готово', 'ok');
+  } catch (e) { setStatus(String(e), 'bad'); }
+}
+$('presets').addEventListener('click', e => { const b = e.target.closest('button'); if (b) rewrite(b.dataset.i); });
+$('custom').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.value.trim()) rewrite(e.target.value.trim()); });
+$('accept').onclick = () => { text.value = $('out').value; $('result').style.display = 'none'; matches = []; render(); check(); };
+$('copyOut').onclick = async () => { await navigator.clipboard.writeText($('out').value); setStatus('Скопировано', 'ok'); };
+
+async function copyAndClose() { await navigator.clipboard.writeText(text.value); win.hide(); }
+$('copy').onclick = copyAndClose;
+$('close').onclick = () => win.hide();
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') win.hide();
+  if (e.key === 'Enter' && e.ctrlKey) copyAndClose();
+});
+
+invoke('source_info').then(i => setStatus(`${i.hotkey} · LT: ${new URL(i.lt).host} · LLM: ${i.model}`));
+</script>
+</body>
+</html>
