@@ -84,7 +84,7 @@ const { listen } = window.__TAURI__.event;
 const win = window.__TAURI__.window.getCurrentWindow();
 const $ = id => document.getElementById(id);
 const text = $('text'), issuesEl = $('issues'), status = $('status');
-const SRC = { selection: 'выделение', field: 'всё поле', clipboard: 'буфер обмена', none: '' };
+const SRC = { selection: 'выделение', field: 'всё поле', line: 'строка терминала', clipboard: 'буфер обмена', none: '' };
 let matches = [], timer, seq = 0;
 
 function setStatus(msg, cls = '') { status.textContent = msg; status.className = cls; }

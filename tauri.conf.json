@@ -17,6 +17,21 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "resizable": true
+      },
+      {
+        "label": "badge",
+        "title": "opengramm badge",
+        "url": "badge.html",
+        "width": 300,
+        "height": 40,
+        "visible": false,
+        "focus": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false
       }
     ],
     "security": { "csp": null }

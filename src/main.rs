@@ -6,9 +6,9 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WindowEvent};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 const SYSTEM_PROMPT: &str = "Ты редактор текста. Перепиши текст пользователя по инструкции. \
 Сохраняй язык оригинала, смысл, имена, ссылки и форматирование. \
@@ -17,7 +17,10 @@ const SYSTEM_PROMPT: &str = "Ты редактор текста. Перепиш�
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct Config {
+    /// opens the full window
     hotkey: String,
+    /// shows the small error badge at the caret
+    check_hotkey: String,
     /// LanguageTool language code, "auto" to detect
     language: String,
     lt_url: String,
@@ -31,6 +34,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             hotkey: "ctrl+alt+g".into(),
+            check_hotkey: "ctrl+alt+h".into(),
             language: "auto".into(),
             lt_url: "https://api.languagetool.org/v2/check".into(),
             openrouter_key: String::new(),
@@ -62,7 +66,7 @@ fn load_config(app: &AppHandle) -> Config {
     cfg
 }
 
-fn on_hotkey(app: &AppHandle) {
+fn on_hotkey(app: &AppHandle, badge: bool) {
     let app = app.clone();
     // UIA initializes COM itself; keep it off the UI thread
     std::thread::spawn(move || {
@@ -70,24 +74,67 @@ fn on_hotkey(app: &AppHandle) {
         let mut c = capture::capture(&cfg.blocklist);
         if c.error.is_none() && c.text.trim().is_empty() {
             c.text = app.clipboard().read_text().unwrap_or_default();
-            c.source = "clipboard";
+            c.source = "clipboard".into();
         }
-        show_popup(&app, c);
+        if badge {
+            show_badge(&app, c);
+        } else {
+            show_popup(&app, c);
+        }
     });
 }
 
-fn show_popup(app: &AppHandle, c: capture::Captured) {
-    let Some(win) = app.get_webview_window("main") else { return };
-    let (mut x, mut y) = capture::cursor_pos();
+/// Put the window just under the caret (or the mouse), kept inside the monitor.
+/// `reserve_w` is the width to keep free on the right, for windows that grow after showing.
+fn place(win: &WebviewWindow, caret: Option<[i32; 4]>, reserve_w: u32) {
+    let (mut x, mut y) = match caret {
+        Some([x, y, _, h]) => (x, y + h + 4),
+        None => {
+            let (x, y) = capture::cursor_pos();
+            (x, y + 16)
+        }
+    };
     if let (Ok(Some(m)), Ok(size)) = (win.monitor_from_point(x as f64, y as f64), win.outer_size()) {
         let (mp, ms) = (m.position(), m.size());
-        x = x.min(mp.x + ms.width as i32 - size.width as i32).max(mp.x);
-        y = (y + 16).min(mp.y + ms.height as i32 - size.height as i32).max(mp.y);
+        x = x.min(mp.x + ms.width as i32 - size.width.max(reserve_w) as i32).max(mp.x);
+        y = y.min(mp.y + ms.height as i32 - size.height as i32).max(mp.y);
     }
     let _ = win.set_position(PhysicalPosition::new(x, y));
+}
+
+fn show_popup(app: &AppHandle, c: capture::Captured) {
+    if let Some(b) = app.get_webview_window("badge") {
+        capture::hide_raw(&b);
+    }
+    let Some(win) = app.get_webview_window("main") else { return };
+    place(&win, c.caret, 0);
     let _ = win.emit("captured", c);
     let _ = win.show();
     let _ = win.set_focus();
+}
+
+/// Badge renders itself, then calls `badge_show` with its real size
+fn show_badge(app: &AppHandle, c: capture::Captured) {
+    let Some(win) = app.get_webview_window("badge") else { return };
+    capture::hide_raw(&win);
+    place(&win, c.caret, (540.0 * win.scale_factor().unwrap_or(1.0)) as u32);
+    let _ = win.emit("captured", c);
+}
+
+#[tauri::command]
+fn badge_show(window: WebviewWindow, w: f64, h: f64) {
+    let _ = window.set_size(LogicalSize::new(w, h));
+    capture::show_no_activate(&window);
+}
+
+#[tauri::command]
+fn badge_hide(window: WebviewWindow) {
+    capture::hide_raw(&window);
+}
+
+#[tauri::command]
+fn open_full(app: AppHandle, c: capture::Captured) {
+    show_popup(&app, c);
 }
 
 fn err(e: impl ToString) -> String {
@@ -151,31 +198,36 @@ fn open_config(app: &AppHandle) {
 
 fn main() {
     tauri::Builder::default()
+        // must be first: a second launch exits right away
+        .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let cfg = load_config(app.handle());
-            let hotkey = cfg.hotkey.clone();
+            let (hotkey, check_hotkey) = (cfg.hotkey.clone(), cfg.check_hotkey.clone());
             app.manage(cfg);
 
+            let check_id = check_hotkey.parse::<Shortcut>().map(|s| s.id()).unwrap_or_default();
             app.handle().plugin(
                 tauri_plugin_global_shortcut::Builder::new()
-                    .with_handler(|app, _, event| {
+                    .with_handler(move |app, shortcut, event| {
                         if event.state == ShortcutState::Pressed {
-                            on_hotkey(app);
+                            on_hotkey(app, shortcut.id() == check_id);
                         }
                     })
                     .build(),
             )?;
-            if let Err(e) = app.global_shortcut().register(hotkey.as_str()) {
-                let error = Some(format!("Горячая клавиша {hotkey} недоступна ({e}). Поменяйте hotkey в config.json и перезапустите."));
-                show_popup(app.handle(), capture::Captured { error, ..Default::default() });
+            for key in [&hotkey, &check_hotkey] {
+                if let Err(e) = app.global_shortcut().register(key.as_str()) {
+                    let error = Some(format!("Горячая клавиша {key} недоступна ({e}). Поменяйте её в config.json и перезапустите."));
+                    show_popup(app.handle(), capture::Captured { error, ..Default::default() });
+                }
             }
 
             let settings = MenuItem::with_id(app, "config", "Настройки (config.json)", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip(format!("opengramm: {hotkey}"))
+                .tooltip(format!("opengramm: {hotkey} окно, {check_hotkey} проверка"))
                 .menu(&Menu::with_items(app, &[&settings, &quit])?)
                 .on_menu_event(|app, e| match e.id.as_ref() {
                     "config" => open_config(app),
@@ -191,7 +243,7 @@ fn main() {
                 let _ = win.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![lt_check, rewrite, source_info])
+        .invoke_handler(tauri::generate_handler![lt_check, rewrite, source_info, badge_show, badge_hide, open_full])
         .run(tauri::generate_context!())
         .expect("error while running opengramm");
 }

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>opengramm badge</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1b1f; --muted:#6b6b76; --line:#d9d9e0; --err:#dc2626; --warn:#d97706; --ok:#16a34a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1c1c20; --fg:#ececf1; --muted:#9a9aa6; --line:#3a3a42; --err:#f87171; --warn:#fbbf24; --ok:#22c55e; }
+  }
+  html, body { margin:0; background:transparent; overflow:hidden; font:12.5px/1.4 "Segoe UI", system-ui, sans-serif; }
+  /* max-content: measure the pill regardless of the current window size */
+  #pill { position:absolute; top:4px; left:4px; width:max-content; max-width:520px; display:flex; align-items:center; gap:8px;
+          padding:4px 10px 4px 5px; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:14px;
+          box-shadow:0 1px 4px rgba(0,0,0,.25); cursor:pointer; user-select:none; }
+  #dot { flex:none; min-width:18px; height:18px; padding:0 4px; box-sizing:border-box; border-radius:9px; display:grid; place-items:center;
+         font-weight:700; font-size:11px; color:#fff; background:var(--muted); }
+  #dot.bad { background:var(--err); }
+  #dot.ok { background:var(--ok); }
+  #line { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; color:var(--muted); }
+  #line u { color:var(--fg); text-decoration:underline wavy var(--err); text-decoration-skip-ink:none; text-underline-offset:3px; }
+  #line u.style { text-decoration-color:var(--warn); }
+  /* space is always reserved so the pill doesn't change width on hover */
+  #x { flex:none; width:16px; height:16px; margin-right:-4px; border-radius:8px; display:grid; place-items:center;
+       font-size:13px; line-height:1; color:var(--muted); opacity:0; transition:opacity .12s; }
+  #pill:hover #x { opacity:1; }
+  #x:hover { background:var(--line); color:var(--fg); }
+</style>
+</head>
+<body>
+<div id="pill" title="Клик: открыть окно · правый клик: скрыть"><span id="dot"></span><span id="line"></span><span id="x" title="Скрыть">✕</span></div>
+<script>
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+const pill = document.getElementById('pill'), dot = document.getElementById('dot'), line = document.getElementById('line');
+let captured = null, hideTimer, seq = 0;
+
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const isStyle = m => m.rule.issueType !== 'misspelling' && m.rule.issueType !== 'grammar';
+
+const hide = () => { clearTimeout(hideTimer); invoke('badge_hide'); };
+function hideIn(ms) { clearTimeout(hideTimer); hideTimer = setTimeout(hide, ms); }
+pill.onmouseenter = () => clearTimeout(hideTimer);
+pill.onmouseleave = () => hideIn(3000);
+// left: open the full window (✕ just hides), right: hide
+pill.onpointerdown = e => {
+  if (e.button === 2) return hide();
+  if (e.button !== 0) return;
+  hide();
+  if (e.target.id !== 'x' && captured) invoke('open_full', { c: captured });
+};
+document.oncontextmenu = e => e.preventDefault();
+
+function show(dotText, dotCls, html, ms) {
+  dot.textContent = dotText; dot.className = dotCls; line.innerHTML = html;
+  const r = pill.getBoundingClientRect();
+  invoke('badge_show', { w: Math.ceil(r.width) + 10, h: Math.ceil(r.height) + 10 });
+  hideIn(ms);
+}
+
+// Only the pieces around errors: "…как <u>деал</u>…"
+function snippets(text, matches) {
+  const v = text.replace(/[\r\n\t]/g, ' '), R = 16, ranges = [];
+  const sorted = [...matches].sort((a, b) => a.offset - b.offset);
+  for (const m of sorted) {
+    const s = Math.max(0, m.offset - R), e = Math.min(v.length, m.offset + m.length + R), last = ranges.at(-1);
+    if (last && s <= last.e) { last.e = Math.max(last.e, e); last.ms.push(m); } else ranges.push({ s, e, ms: [m] });
+  }
+  return ranges.map(({ s, e, ms }) => {
+    let html = s > 0 ? '…' : '', pos = s;
+    for (const m of ms) {
+      if (m.offset < pos) continue;
+      html += esc(v.slice(pos, m.offset)) + `<u class="${isStyle(m) ? 'style' : ''}">${esc(v.substr(m.offset, m.length))}</u>`;
+      pos = m.offset + m.length;
+    }
+    return html + esc(v.slice(pos, e)) + (e < v.length ? '…' : '');
+  }).join(' ');
+}
+
+listen('captured', async ({ payload: c }) => {
+  captured = c;
+  const my = ++seq;
+  if (c.error) return show('🔒', '', esc(c.error), 3000);
+  if (!c.text.trim()) return show('?', '', 'Текст не найден: выделите или скопируйте его', 3000);
+  try {
+    const r = await invoke('lt_check', { text: c.text });
+    if (my !== seq) return;
+    if (!r.matches.length) return show('✓', 'ok', 'Ошибок нет', 2000);
+    show(String(r.matches.length), 'bad', snippets(c.text, r.matches), 8000);
+  } catch (e) {
+    if (my === seq) show('!', '', esc(String(e)).slice(0, 200), 4000);
+  }
+});
+</script>
+</body>
+</html>
