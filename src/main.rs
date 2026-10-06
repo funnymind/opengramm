@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
@@ -241,7 +242,14 @@ async fn rewrite(text: String, instruction: String, cfg: State<'_, Config>) -> R
 
 #[tauri::command]
 fn source_info(cfg: State<'_, Config>) -> Value {
-    json!({ "model": cfg.model, "lt": cfg.lt_url, "hotkey": cfg.hotkey })
+    json!({ "model": cfg.model, "lt": cfg.lt_url, "hotkey": cfg.hotkey, "check_hotkey": cfg.check_hotkey })
+}
+
+fn show_help(app: &AppHandle) {
+    let Some(win) = app.get_webview_window("main") else { return };
+    let _ = win.emit("help", ());
+    let _ = win.show();
+    let _ = win.set_focus();
 }
 
 fn open_config(app: &AppHandle) {
@@ -257,6 +265,7 @@ fn main() {
         // must be first: a second launch exits right away
         .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .setup(|app| {
             let cfg = load_config(app.handle());
             let (hotkey, check_hotkey) = (cfg.hotkey.clone(), cfg.check_hotkey.clone());
@@ -284,13 +293,30 @@ fn main() {
                 }
             }
 
+            let help = MenuItem::with_id(app, "help", "Справка", true, None::<&str>)?;
+            let autostart = CheckMenuItem::with_id(
+                app,
+                "autostart",
+                "Запускать при входе в Windows",
+                true,
+                app.autolaunch().is_enabled().unwrap_or(false),
+                None::<&str>,
+            )?;
             let settings = MenuItem::with_id(app, "config", "Настройки (config.json)", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+            let toggle = autostart.clone();
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip(format!("opengramm: {hotkey} окно, {check_hotkey} проверка"))
-                .menu(&Menu::with_items(app, &[&settings, &quit])?)
-                .on_menu_event(|app, e| match e.id.as_ref() {
+                .menu(&Menu::with_items(app, &[&help, &autostart, &settings, &quit])?)
+                .on_menu_event(move |app, e| match e.id.as_ref() {
+                    "help" => show_help(app),
+                    "autostart" => {
+                        let al = app.autolaunch();
+                        let on = al.is_enabled().unwrap_or(false);
+                        let _ = if on { al.disable() } else { al.enable() };
+                        let _ = toggle.set_checked(al.is_enabled().unwrap_or(!on));
+                    }
                     "config" => open_config(app),
                     "quit" => app.exit(0),
                     _ => {}

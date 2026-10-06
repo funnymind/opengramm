@@ -76,7 +76,7 @@ mod win {
     use uiautomation::types::TextUnit;
     use uiautomation::{UIAutomation, UIElement};
     use windows::core::PWSTR;
-    use windows::Win32::Foundation::{CloseHandle, POINT};
+    use windows::Win32::Foundation::{CloseHandle, HWND, POINT};
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::System::Ole::{SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetUBound, SafeArrayUnaccessData};
     use windows::Win32::System::Threading::{
@@ -93,16 +93,21 @@ mod win {
         (p.x, p.y)
     }
 
+    /// tauri and uiautomation pull different `windows` versions; HWND is the same pointer
+    fn hwnd_of(win: &tauri::WebviewWindow) -> Option<HWND> {
+        win.hwnd().ok().map(|h| HWND(h.0 as _))
+    }
+
     /// Show without stealing focus from the field the user is typing in
     pub fn show_no_activate(win: &tauri::WebviewWindow) {
-        if let Ok(hwnd) = win.hwnd() {
+        if let Some(hwnd) = hwnd_of(win) {
             let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
         }
     }
 
     /// Pair of `show_no_activate`: tauri's hide() is a no-op here, it never saw the window shown
     pub fn hide_raw(win: &tauri::WebviewWindow) {
-        if let Ok(hwnd) = win.hwnd() {
+        if let Some(hwnd) = hwnd_of(win) {
             let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
         }
     }

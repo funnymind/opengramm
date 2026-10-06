@@ -41,14 +41,35 @@
   #status { flex:1; color:var(--muted); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
   .ok { color:var(--accent); }
   .bad { color:var(--err); }
+  #help { display:none; flex:1; overflow:auto; padding:4px 14px 10px; }
+  #help.on { display:block; }
+  #help h3 { margin:10px 0 6px; font-size:14px; }
+  #help ul { margin:0; padding-left:18px; }
+  #help li { margin-bottom:6px; color:var(--fg); }
+  #help p { color:var(--muted); }
+  body.help main, body.help footer { display:none; }
 </style>
 </head>
 <body>
 <header data-tauri-drag-region>
   <b data-tauri-drag-region>opengramm</b>
   <span class="src" id="src" data-tauri-drag-region></span>
+  <button id="helpBtn" title="Справка (F1)">?</button>
   <button id="close" title="Esc">✕</button>
 </header>
+<section id="help">
+  <h3>Как пользоваться</h3>
+  <ul>
+    <li><b id="hAuto">Автопроверка</b>: печатайте где угодно и остановитесь на пару секунд. Если LanguageTool нашёл ошибки, у каретки появится плашка. Клик по ней открывает это окно, ✕ или правый клик скрывает, сама она исчезает через 8 с.</li>
+    <li><b id="hCheck">Ctrl+Alt+H</b>: проверить сейчас. В отличие от автопроверки, отвечает всегда, в том числе «Ошибок нет».</li>
+    <li><b id="hOpen">Ctrl+Alt+G</b>: открыть это окно. Выделите текст заранее, иначе возьмётся всё поле.</li>
+    <li><b>В окне</b>: ошибки подчёркнуты, клик по зелёному варианту подставляет его. Кнопки тона и своя инструкция переписывают текст через ИИ. <b>Ctrl+Enter</b> копирует и закрывает, <b>Esc</b> закрывает.</li>
+    <li><b>Откуда берётся текст</b>: выделение → всё поле → абзац под кареткой (в длинных документах) → строка терминала без промпта. Если приложение текст не отдаёт (Sublime, часть Electron), нажмите <b>Ctrl+C</b> и горячую клавишу: возьмётся буфер обмена.</li>
+    <li><b>Приватность</b>: поля паролей и приложения из чёрного списка не читаются. Текст уходит в LanguageTool автоматически, в ИИ — только по кнопке.</li>
+    <li><b>Настройки</b>: трей → «Настройки», файл config.json. Там горячие клавиши, ключ OpenRouter, модель, чёрный список и параметры автопроверки. Изменения применяются после перезапуска.</li>
+  </ul>
+  <p id="helpFoot"></p>
+</section>
 <main>
   <div class="editor">
     <div id="hl" aria-hidden="true"></div>
@@ -91,6 +112,7 @@ function setStatus(msg, cls = '') { status.textContent = msg; status.className =
 function esc(s) { return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
 listen('captured', ({ payload: c }) => {
+  setHelp(false);
   $('src').textContent = [c.app, SRC[c.source]].filter(Boolean).join(' · ');
   $('result').style.display = 'none';
   text.value = c.error ? '' : c.text;
@@ -175,7 +197,20 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && e.ctrlKey) copyAndClose();
 });
 
-invoke('source_info').then(i => setStatus(`${i.hotkey} · LT: ${new URL(i.lt).host} · LLM: ${i.model}`));
+function setHelp(on) {
+  document.body.classList.toggle('help', on);
+  $('help').classList.toggle('on', on);
+}
+$('helpBtn').onclick = () => setHelp(!document.body.classList.contains('help'));
+listen('help', () => setHelp(true));
+document.addEventListener('keydown', e => { if (e.key === 'F1') setHelp(!document.body.classList.contains('help')); });
+
+invoke('source_info').then(i => {
+  setStatus(`${i.hotkey} · LT: ${new URL(i.lt).host} · LLM: ${i.model}`);
+  $('hOpen').textContent = i.hotkey.replace(/\b\w/g, c => c.toUpperCase());
+  $('hCheck').textContent = i.check_hotkey.replace(/\b\w/g, c => c.toUpperCase());
+  $('helpFoot').textContent = `Проверка орфографии: ${new URL(i.lt).host} · Переписывание: ${i.model} через openrouter.ai`;
+});
 </script>
 </body>
 </html>
