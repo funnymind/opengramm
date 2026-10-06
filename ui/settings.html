@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>opengramm — настройки</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1b1f; --muted:#6b6b76; --line:#e3e3e8; --card:#f6f6f8; --accent:#16a34a; --err:#dc2626; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1c1c20; --fg:#ececf1; --muted:#9a9aa6; --line:#33333a; --card:#26262c; --accent:#22c55e; --err:#f87171; }
+  }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:13px/1.45 "Segoe UI", system-ui, sans-serif; }
+  body { display:flex; flex-direction:column; }
+  main { flex:1; overflow:auto; padding:12px 16px; }
+  h3 { margin:16px 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  h3:first-child { margin-top:0; }
+  label { display:block; margin-bottom:10px; }
+  label > span { display:block; margin-bottom:3px; }
+  .hint { color:var(--muted); font-size:12px; }
+  input[type=text], input[type=password], input[type=number], textarea, select {
+    width:100%; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; font:inherit; }
+  textarea { resize:vertical; min-height:56px; }
+  .check { display:flex; align-items:center; gap:8px; }
+  .check input { width:16px; height:16px; }
+  .cols { display:flex; gap:10px; }
+  .cols > label { flex:1; }
+  footer { display:flex; gap:8px; align-items:center; padding:10px 16px; border-top:1px solid var(--line); }
+  #status { flex:1; color:var(--muted); }
+  #status.ok { color:var(--accent); }
+  #status.bad { color:var(--err); }
+  button { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 12px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+</style>
+</head>
+<body>
+<main>
+  <h3>Горячие клавиши</h3>
+  <div class="cols">
+    <label><span>Окно с правками</span><input type="text" id="hotkey" placeholder="ctrl+alt+g"></label>
+    <label><span>Быстрая проверка</span><input type="text" id="check_hotkey" placeholder="ctrl+alt+h"></label>
+  </div>
+  <p class="hint">Формат: <code>ctrl+alt+g</code>, <code>shift+f9</code>, <code>ctrl+shift+space</code>. Если клавиша занята другой программой, внизу появится ошибка.</p>
+
+  <h3>Автопроверка</h3>
+  <label class="check"><input type="checkbox" id="auto_check"><span>Проверять сама, когда я перестаю печатать</span></label>
+  <div class="cols">
+    <label><span>Пауза перед проверкой, мс</span><input type="number" id="auto_delay_ms" min="300" step="100"></label>
+    <label><span>Не чаще чем раз в, мс</span><input type="number" id="auto_min_interval_ms" min="1000" step="500"></label>
+    <label><span>Длинное поле: от, символов</span><input type="number" id="auto_max_chars" min="200" step="100"></label>
+  </div>
+  <p class="hint">В поле длиннее порога проверяется только абзац под кареткой. Публичный LanguageTool принимает не больше 20 запросов в минуту: это интервал 3000 мс.</p>
+
+  <h3>Проверка орфографии</h3>
+  <label><span>Язык</span>
+    <select id="language">
+      <option value="auto">Определять автоматически</option>
+      <option value="ru-RU">Русский</option>
+      <option value="en-US">English (US)</option>
+      <option value="en-GB">English (UK)</option>
+      <option value="uk-UA">Українська</option>
+      <option value="de-DE">Deutsch</option>
+    </select>
+  </label>
+  <label><span>Адрес LanguageTool</span><input type="text" id="lt_url"></label>
+  <label><span>Отключённые правила, по одному в строке</span><textarea id="disabled_rules" spellcheck="false"></textarea></label>
+  <p class="hint">Например, <code>UPPERCASE_SENTENCE_START</code> — не требовать заглавную букву в начале. Идентификатор правила виден в ответе LanguageTool.</p>
+
+  <h3>Переписывание текста (ИИ)</h3>
+  <label><span>Ключ OpenRouter</span><input type="password" id="openrouter_key" placeholder="sk-or-…"></label>
+  <label><span>Модель</span><input type="text" id="model" placeholder="anthropic/claude-haiku-4.5"></label>
+  <p class="hint">Ключ хранится в вашем config.json. Если поле пустое, берётся переменная окружения OPENROUTER_API_KEY.</p>
+
+  <h3>Приватность</h3>
+  <label><span>Не читать текст в этих программах, по одной в строке</span><textarea id="blocklist" spellcheck="false"></textarea></label>
+  <p class="hint">Имена процессов, например <code>KeePassXC.exe</code>. Поля паролей не читаются всегда, независимо от списка.</p>
+</main>
+<footer>
+  <span id="status"></span>
+  <button id="openFile">config.json</button>
+  <button id="cancel">Закрыть</button>
+  <button class="primary" id="save">Сохранить</button>
+</footer>
+<script>
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+const win = window.__TAURI__.window.getCurrentWindow();
+const $ = id => document.getElementById(id);
+const TEXT = ['hotkey', 'check_hotkey', 'lt_url', 'model', 'openrouter_key', 'language'];
+const NUM = ['auto_delay_ms', 'auto_min_interval_ms', 'auto_max_chars'];
+const LIST = ['blocklist', 'disabled_rules'];
+
+async function load() {
+  const c = await invoke('read_config');
+  for (const k of [...TEXT, ...NUM]) $(k).value = c[k];
+  for (const k of LIST) $(k).value = (c[k] || []).join('\n');
+  $('auto_check').checked = c.auto_check;
+  setStatus('');
+}
+
+function setStatus(msg, cls = '') { $('status').textContent = msg; $('status').className = cls; }
+
+$('save').onclick = async () => {
+  const cfg = { auto_check: $('auto_check').checked };
+  for (const k of TEXT) cfg[k] = $(k).value.trim();
+  for (const k of NUM) cfg[k] = Number($(k).value);
+  for (const k of LIST) cfg[k] = $(k).value.split('\n').map(s => s.trim()).filter(Boolean);
+  try {
+    const busy = await invoke('save_config', { cfg });
+    if (busy.length) setStatus(`Заняты другой программой: ${busy.join(', ')}`, 'bad');
+    else setStatus('Сохранено, применилось сразу', 'ok');
+  } catch (e) { setStatus(String(e), 'bad'); }
+};
+$('cancel').onclick = () => win.hide();
+$('openFile').onclick = () => invoke('open_config_file');
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') win.hide();
+  if (e.key === 'Enter' && e.ctrlKey) $('save').click();
+});
+
+listen('opened', load); // re-read on every open, the file may have been edited by hand
+load();
+</script>
+</body>
+</html>

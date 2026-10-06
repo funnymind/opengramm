@@ -1,5 +1,5 @@
 {
   "identifier": "default",
-  "windows": ["main", "badge"],
+  "windows": ["main", "badge", "settings"],
   "permissions": ["core:default", "core:window:allow-hide", "core:window:allow-start-dragging"]
 }

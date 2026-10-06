@@ -5,10 +5,11 @@ mod typing;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -38,6 +39,8 @@ struct Config {
     auto_min_interval_ms: u64,
     /// Longer fields are checked by the paragraph at the caret
     auto_max_chars: usize,
+    /// LanguageTool rule ids to ignore, e.g. "UPPERCASE_SENTENCE_START"
+    disabled_rules: Vec<String>,
 }
 
 impl Default for Config {
@@ -56,6 +59,8 @@ impl Default for Config {
             auto_delay_ms: 1500,
             auto_min_interval_ms: 3000,
             auto_max_chars: 2000,
+            // we often send a fragment (a paragraph or one line), so "start with a capital" is noise
+            disabled_rules: vec!["UPPERCASE_SENTENCE_START".into()],
         }
     }
 }
@@ -80,11 +85,16 @@ fn load_config(app: &AppHandle) -> Config {
     cfg
 }
 
+/// Settings are editable at runtime, so every user takes a snapshot
+fn conf(app: &AppHandle) -> Config {
+    app.state::<Mutex<Config>>().lock().unwrap().clone()
+}
+
 fn on_hotkey(app: &AppHandle, badge: bool) {
     let app = app.clone();
     // UIA initializes COM itself; keep it off the UI thread
     std::thread::spawn(move || {
-        let cfg = app.state::<Config>();
+        let cfg = conf(&app);
         let mut c = capture::capture(&cfg.blocklist, usize::MAX);
         if c.error.is_none() && c.text.trim().is_empty() {
             c.text = app.clipboard().read_text().unwrap_or_default();
@@ -157,21 +167,24 @@ fn err(e: impl ToString) -> String {
 
 /// Runs on its own thread: one LT request per typing pause, only if the text changed
 fn auto_loop(app: AppHandle) {
-    let cfg = app.state::<Config>().inner().clone();
+    static HOOK: Once = Once::new();
     let own_exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_default();
-    let min_interval = Duration::from_millis(cfg.auto_min_interval_ms);
     let mut last_check: Option<Instant> = None;
     let mut last_text = String::new();
-    typing::start_hook();
     loop {
         std::thread::sleep(Duration::from_millis(250));
+        let cfg = conf(&app);
+        if !cfg.auto_check {
+            continue;
+        }
+        HOOK.call_once(typing::start_hook); // installed only once auto-check is actually on
         if !typing::take_if_idle(cfg.auto_delay_ms) {
             continue;
         }
-        if last_check.is_some_and(|t| t.elapsed() < min_interval) {
+        if last_check.is_some_and(|t| t.elapsed() < Duration::from_millis(cfg.auto_min_interval_ms)) {
             typing::mark_dirty(); // retry on a later tick
             continue;
         }
@@ -195,9 +208,14 @@ fn auto_loop(app: AppHandle) {
 }
 
 async fn lt(cfg: &Config, text: &str) -> Result<Value, String> {
+    let rules = cfg.disabled_rules.join(",");
+    let mut form = vec![("text", text), ("language", cfg.language.as_str())];
+    if !rules.is_empty() {
+        form.push(("disabledRules", &rules));
+    }
     let res = reqwest::Client::new()
         .post(&cfg.lt_url)
-        .form(&[("text", text), ("language", cfg.language.as_str())])
+        .form(&form)
         .send()
         .await
         .map_err(err)?;
@@ -208,14 +226,59 @@ async fn lt(cfg: &Config, text: &str) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn lt_check(text: String, cfg: State<'_, Config>) -> Result<Value, String> {
-    lt(&cfg, &text).await
+async fn lt_check(app: AppHandle, text: String) -> Result<Value, String> {
+    lt(&conf(&app), &text).await
+}
+
+/// Config as stored on disk (without a key coming from the environment)
+#[tauri::command]
+fn read_config(app: AppHandle) -> Value {
+    let cfg: Config = std::fs::read_to_string(config_path(&app))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    json!(cfg)
 }
 
 #[tauri::command]
-async fn rewrite(text: String, instruction: String, cfg: State<'_, Config>) -> Result<String, String> {
+fn save_config(app: AppHandle, cfg: Config) -> Result<Vec<String>, String> {
+    std::fs::write(config_path(&app), serde_json::to_string_pretty(&cfg).map_err(err)?).map_err(err)?;
+    let mut live = cfg;
+    if live.openrouter_key.is_empty() {
+        live.openrouter_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+    }
+    *app.state::<Mutex<Config>>().lock().unwrap() = live;
+    Ok(apply_hotkeys(&app))
+}
+
+/// Re-registers both shortcuts; returns the ones Windows refused
+fn apply_hotkeys(app: &AppHandle) -> Vec<String> {
+    let cfg = conf(app);
+    let _ = app.global_shortcut().unregister_all();
+    [cfg.hotkey, cfg.check_hotkey]
+        .into_iter()
+        .filter(|key| app.global_shortcut().register(key.as_str()).is_err())
+        .collect()
+}
+
+#[tauri::command]
+fn open_settings(app: AppHandle) {
+    let Some(win) = app.get_webview_window("settings") else { return };
+    let _ = win.emit("opened", ());
+    let _ = win.show();
+    let _ = win.set_focus();
+}
+
+#[tauri::command]
+fn open_config_file(app: AppHandle) {
+    open_config(&app);
+}
+
+#[tauri::command]
+async fn rewrite(app: AppHandle, text: String, instruction: String) -> Result<String, String> {
+    let cfg = conf(&app);
     if cfg.openrouter_key.is_empty() {
-        return Err("Нет ключа OpenRouter: укажите openrouter_key в config.json (трей → Настройки) или OPENROUTER_API_KEY".into());
+        return Err("Нет ключа OpenRouter: укажите его в настройках (трей → Настройки) или в OPENROUTER_API_KEY".into());
     }
     let body = json!({
         "model": cfg.model,
@@ -241,7 +304,8 @@ async fn rewrite(text: String, instruction: String, cfg: State<'_, Config>) -> R
 }
 
 #[tauri::command]
-fn source_info(cfg: State<'_, Config>) -> Value {
+fn source_info(app: AppHandle) -> Value {
+    let cfg = conf(&app);
     json!({ "model": cfg.model, "lt": cfg.lt_url, "hotkey": cfg.hotkey, "check_hotkey": cfg.check_hotkey })
 }
 
@@ -266,31 +330,29 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        // before setup: windows are created first and their pages may invoke commands right away
+        .manage(Mutex::new(Config::default()))
         .setup(|app| {
             let cfg = load_config(app.handle());
             let (hotkey, check_hotkey) = (cfg.hotkey.clone(), cfg.check_hotkey.clone());
-            let auto = cfg.auto_check;
-            app.manage(cfg);
-            if auto {
-                let handle = app.handle().clone();
-                std::thread::spawn(move || auto_loop(handle));
-            }
+            *app.state::<Mutex<Config>>().lock().unwrap() = cfg;
+            let handle = app.handle().clone();
+            std::thread::spawn(move || auto_loop(handle));
 
-            let check_id = check_hotkey.parse::<Shortcut>().map(|s| s.id()).unwrap_or_default();
             app.handle().plugin(
                 tauri_plugin_global_shortcut::Builder::new()
-                    .with_handler(move |app, shortcut, event| {
+                    .with_handler(|app, shortcut, event| {
                         if event.state == ShortcutState::Pressed {
-                            on_hotkey(app, shortcut.id() == check_id);
+                            // settings are editable at runtime, so resolve the id on each press
+                            let check = conf(app).check_hotkey.parse::<Shortcut>().map(|s| s.id()).unwrap_or_default();
+                            on_hotkey(app, shortcut.id() == check);
                         }
                     })
                     .build(),
             )?;
-            for key in [&hotkey, &check_hotkey] {
-                if let Err(e) = app.global_shortcut().register(key.as_str()) {
-                    let error = Some(format!("Горячая клавиша {key} недоступна ({e}). Поменяйте её в config.json и перезапустите."));
-                    show_popup(app.handle(), capture::Captured { error, ..Default::default() });
-                }
+            for key in apply_hotkeys(app.handle()) {
+                let error = Some(format!("Горячая клавиша {key} занята другой программой. Поменяйте её в настройках (трей → Настройки)."));
+                show_popup(app.handle(), capture::Captured { error, ..Default::default() });
             }
 
             let help = MenuItem::with_id(app, "help", "Справка", true, None::<&str>)?;
@@ -302,7 +364,7 @@ fn main() {
                 app.autolaunch().is_enabled().unwrap_or(false),
                 None::<&str>,
             )?;
-            let settings = MenuItem::with_id(app, "config", "Настройки (config.json)", true, None::<&str>)?;
+            let settings = MenuItem::with_id(app, "config", "Настройки", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
             let toggle = autostart.clone();
             TrayIconBuilder::new()
@@ -317,7 +379,7 @@ fn main() {
                         let _ = if on { al.disable() } else { al.enable() };
                         let _ = toggle.set_checked(al.is_enabled().unwrap_or(!on));
                     }
-                    "config" => open_config(app),
+                    "config" => open_settings(app.clone()),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -330,7 +392,18 @@ fn main() {
                 let _ = win.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![lt_check, rewrite, source_info, badge_show, badge_hide, open_full])
+        .invoke_handler(tauri::generate_handler![
+            lt_check,
+            rewrite,
+            source_info,
+            badge_show,
+            badge_hide,
+            open_full,
+            read_config,
+            save_config,
+            open_settings,
+            open_config_file
+        ])
         .run(tauri::generate_context!())
         .expect("error while running opengramm");
 }
